@@ -1,0 +1,232 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Room Video Chat (WebRTC + PHP Signaling)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 p-6">
+  <div class="max-w-5xl mx-auto">
+    <div class="flex items-center gap-4 mb-4">
+      <input id="roomInput" class="p-2 border rounded" placeholder="Enter room code or leave blank for auto" />
+      <button id="createBtn" class="bg-blue-600 text-white px-4 py-2 rounded">Create / Join</button>
+      <span id="status" class="ml-4 text-gray-600"></span>
+    </div>
+
+    <div class="grid grid-cols-3 gap-4" id="videos">
+      <div>
+        <video id="localVideo" autoplay muted playsinline class="w-full rounded shadow bg-black"></video>
+        <div class="text-sm text-gray-600 mt-1">You</div>
+      </div>
+    </div>
+
+    <div class="mt-6">
+      <div class="flex gap-2">
+        <input id="chatInput" class="flex-1 p-2 border rounded" placeholder="Type message and press Enter" />
+        <button id="sendBtn" class="bg-green-600 text-white px-4 py-2 rounded">Send</button>
+      </div>
+      <div id="chatBox" class="mt-3 p-3 border rounded h-40 overflow-y-auto bg-white"></div>
+    </div>
+  </div>
+
+<script>
+const WS_URL = 'ws://localhost:8080'; // change if remote server
+let ws;
+let clientId = null;
+let room = null;
+const peers = {}; // peerId => { pc, dataChannel, videoEl }
+
+const localVideo = document.getElementById('localVideo');
+const videos = document.getElementById('videos');
+const status = document.getElementById('status');
+const chatBox = document.getElementById('chatBox');
+const chatInput = document.getElementById('chatInput');
+
+const constraints = { audio: true, video: { width: { ideal: 640 }, height: { ideal: 480 } } };
+const localStreamPromise = navigator.mediaDevices.getUserMedia(constraints)
+  .then(s => { localVideo.srcObject = s; return s; })
+  .catch(err => { alert('Could not access camera/mic: ' + err.message); throw err; });
+
+function connectWs() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => status.innerText = 'Connected to signaling server';
+  ws.onmessage = (evt) => {
+    let msg = JSON.parse(evt.data);
+    handleSignalMessage(msg);
+  };
+  ws.onclose = () => status.innerText = 'Disconnected';
+}
+
+function sendSignal(obj) {
+  ws.send(JSON.stringify(obj));
+}
+
+function uuid() { return Math.random().toString(36).substr(2, 9); }
+
+async function handleSignalMessage(msg) {
+  const t = msg.type;
+  if (t === 'welcome') {
+    clientId = msg.id;
+    console.log('my id', clientId);
+  } else if (t === 'room-joined') {
+    // Joined room, server returns existing peers
+    clientId = msg.id;
+    const existing = msg.peers || [];
+    status.innerText = `Joined room ${room} — ${existing.length} participant(s)`;
+    // create offer to each existing peer
+    for (const peerId of existing) {
+      await preparePeerConnection(peerId, true);
+    }
+  } else if (t === 'peer-joined') {
+    const newPeer = msg.id;
+    // The new peer will wait for offers if you already exist — make an offer to them
+    await preparePeerConnection(newPeer, true);
+  } else if (t === 'offer') {
+    // remote sent SDP offer
+    const from = msg.from;
+    await preparePeerConnection(from, false);
+    await peers[from].pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+    const answer = await peers[from].pc.createAnswer();
+    await peers[from].pc.setLocalDescription(answer);
+    sendSignal({ type: 'answer', target: from, sdp: peers[from].pc.localDescription });
+  } else if (t === 'answer') {
+    const from = msg.from;
+    await peers[from].pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+  } else if (t === 'ice') {
+    const from = msg.from;
+    if (peers[from] && msg.candidate) {
+      try {
+        await peers[from].pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      } catch (e) {
+        console.warn('addIceCandidate failed', e);
+      }
+    }
+  } else if (t === 'peer-left') {
+    const id = msg.id;
+    removePeer(id);
+  } else if (t === 'chat') {
+    // If server relays chat messages (optional)
+    appendChat(`${msg.from}: ${msg.text}`);
+  }
+}
+
+async function preparePeerConnection(peerId, isInitiator) {
+  if (peers[peerId]) return; // already exists
+
+  const pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+      // Add TURN servers here for real-world usage
+    ]
+  });
+
+  peers[peerId] = { pc, dataChannel: null, videoEl: null };
+
+  // add local tracks
+  const localStream = await localStreamPromise;
+  for (const track of localStream.getTracks()) pc.addTrack(track, localStream);
+
+  // create remote video element
+  const videoEl = document.createElement('video');
+  videoEl.autoplay = true;
+  videoEl.playsInline = true;
+  videoEl.id = 'video_' + peerId;
+  const wrapper = document.createElement('div');
+  wrapper.appendChild(videoEl);
+  const label = document.createElement('div');
+  label.className = 'text-sm text-gray-600 mt-1';
+  label.innerText = peerId;
+  wrapper.appendChild(label);
+  videos.appendChild(wrapper);
+  peers[peerId].videoEl = videoEl;
+
+  // ontrack
+  pc.ontrack = (ev) => {
+    // attach stream
+    videoEl.srcObject = ev.streams[0];
+  };
+
+  // datachannel for chat
+  if (isInitiator) {
+    const dc = pc.createDataChannel('chat');
+    setupDataChannel(peerId, dc);
+    peers[peerId].dataChannel = dc;
+  } else {
+    pc.ondatachannel = (e) => {
+      const dc = e.channel;
+      setupDataChannel(peerId, dc);
+      peers[peerId].dataChannel = dc;
+    };
+  }
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      sendSignal({ type: 'ice', target: peerId, candidate: e.candidate });
+    }
+  };
+
+  if (isInitiator) {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendSignal({ type: 'offer', target: peerId, sdp: pc.localDescription });
+  }
+}
+
+function setupDataChannel(peerId, dc) {
+  dc.onopen = () => console.log('DC open with', peerId);
+  dc.onmessage = (e) => appendChat(`${peerId}: ${e.data}`);
+}
+
+function appendChat(text) {
+  const p = document.createElement('div');
+  p.innerText = text;
+  chatBox.appendChild(p);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function removePeer(peerId) {
+  if (!peers[peerId]) return;
+  try { peers[peerId].pc.close(); } catch {}
+  if (peers[peerId].videoEl && peers[peerId].videoEl.parentNode) peers[peerId].videoEl.parentNode.remove();
+  delete peers[peerId];
+  appendChat(`System: ${peerId} left`);
+}
+
+document.getElementById('createBtn').addEventListener('click', async () => {
+  room = document.getElementById('roomInput').value.trim() || ('room-' + uuid());
+  if (!ws || ws.readyState !== WebSocket.OPEN) connectWs();
+  // wait a tiny bit for welcome message
+  const waitForWelcome = () => new Promise(res => {
+    const i = setInterval(() => {
+      if (clientId !== null) { clearInterval(i); res(); }
+    }, 50);
+    setTimeout(() => { clearInterval(i); res(); }, 2000);
+  });
+  await waitForWelcome();
+  sendSignal({ type: 'join', room: room });
+  status.innerText = `Joining ${room}...`;
+});
+
+document.getElementById('sendBtn').addEventListener('click', sendChat);
+chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+
+function sendChat() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  appendChat(`You: ${text}`);
+  // Send via datachannels to all peers
+  for (const pid in peers) {
+    const dc = peers[pid].dataChannel;
+    if (dc && dc.readyState === 'open') dc.send(text);
+  }
+  // Optionally send via server for persistence / others
+  // sendSignal({ type: 'chat', target: null, text });
+  chatInput.value = '';
+}
+
+// start getUserMedia early
+localStreamPromise.catch(()=>{});
+</script>
+</body>
+</html>
